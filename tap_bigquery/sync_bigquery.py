@@ -1,13 +1,16 @@
-import copy, datetime, json, time
+import copy, json, time 
 import dateutil.parser
 from decimal import Decimal
+from datetime import datetime, timedelta
 
 from os import environ
 import singer
 import singer.metrics as metrics
 
 from google.cloud import bigquery
+from google.cloud import bigquery_storage
 from google.oauth2 import service_account
+from google.cloud.bigquery_storage import types
 import pandas as pd
 
 from . import utils
@@ -31,6 +34,10 @@ BOOKMARK_KEY_NAME = "last_update"
 SERVICE_ACCOUNT_INFO_ENV_VAR = "GOOGLE_APPLICATION_CREDENTIALS_STRING"
 credentials_json = environ.get(SERVICE_ACCOUNT_INFO_ENV_VAR)
 
+def increment_table_date(datetime_str):
+    d = datetime.strptime(datetime_str, "%Y%m%d") + timedelta(days=1)
+    return datetime.strftime(d, "%Y%m%d")
+
 
 def get_bigquery_credentials():
     return service_account.Credentials.from_service_account_info(
@@ -44,26 +51,9 @@ def _build_query(keys, filters=[], inclusive_start=True, limit=None):
         columns = columns + "," + keys["datetime_key"]
     keys["columns"] = columns
 
-    query = "SELECT {columns} FROM {table} WHERE 1=1".format(**keys)
-
-    if filters:
-        for f in filters:
-            query = query + " AND " + f
-
-    if keys.get("datetime_key") and keys.get("start_datetime"):
-        if inclusive_start:
-            query = query + (" AND {start_datetime} <= " + "{datetime_key}").format(
-                **keys
-            )
-        else:
-            query = query + (" AND {start_datetime}) < " + "{datetime_key}").format(
-                **keys
-            )
-
-    if keys.get("datetime_key") and keys.get("end_datetime"):
-        query = query + (" AND {datetime_key} < " + "{end_datetime}").format(**keys)
-    if keys.get("datetime_key"):
-        query = query + " ORDER BY {datetime_key}".format(**keys)
+    # TODO Select specific tables from the event_ individually to reduce payload
+    # on ingest.
+    query = ("SELECT {columns} FROM {table}{start_datetime} WHERE 1=1").format(**keys)
 
     if limit is not None:
         query = query + " LIMIT %d" % limit
@@ -163,6 +153,10 @@ def do_sync(config, state, stream):
 
     inclusive_start = True
     start_datetime = singer.get_bookmark(state, tap_stream_id, BOOKMARK_KEY_NAME)
+
+    if state.get("bookmarks") is not None:
+        start_datetime = increment_table_date(start_datetime)
+
     if start_datetime:
         if not config.get("start_always_inclusive"):
             inclusive_start = False
@@ -194,19 +188,49 @@ def do_sync(config, state, stream):
 
     LOGGER.info("Running query:\n    %s" % query)
 
-    df = pd.read_gbq(
-        query=query,
-        use_bqstorage_api=True,
-        project_id=project_id,
-        credentials=bq_credentials,
-    )
+    # df = pd.read_gbq(
+    #     query=query,
+    #     use_bqstorage_api=True,
+    #     project_id=project_id,
+    #     credentials=bq_credentials,
+    # )
 
+    bqstorageclient = bigquery_storage.BigQueryReadClient(credentials=bq_credentials)
+    dataset_id = "analytics_327957226"
+    table_id = f'{keys["keys"]}_{keys["start_datetime"]}'
+    table = f"projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+
+    parent = "projects/{}".format(project_id)
+
+    requested_session = types.ReadSession(
+        table=table,
+        data_format=types.DataFormat.ARROW,
+    )
+    read_session = bqstorageclient.create_read_session(
+        parent=parent,
+        read_session=requested_session,
+        max_stream_count=1,
+    )
+    LOGGER.info("Stating reading the stream")
     with metrics.record_counter(tap_stream_id) as counter:
-        for row in df.to_json(orient="records", lines=True).splitlines():
-            record = json.loads(row)
-            last_update = record[keys["datetime_key"]]
-            singer.write_record(stream.stream, record)
-            counter.increment()
+        for stream_obj in read_session.streams:
+            reader = bqstorageclient.read_rows(stream_obj.name)
+            # Parse all Arrow blocks and create a dataframe.
+            frames = []
+            counter_data = 0
+            for message in reader.rows().pages:
+                frames.append(message.to_dataframe())
+                if len(frames) > 5000:
+                    df = pd.concat(frames)
+                    LOGGER.info(counter_data)
+                    for row in df.to_json(orient="records", lines=True).splitlines():
+                        record = json.loads(row)
+                        last_update = record[keys["datetime_key"]]
+                        singer.write_record(stream.stream, record)
+                        counter.increment()
+                    LOGGER.info("Done sending data")
+                    counter_data += 1
+                    frames = []
 
     state = singer.write_bookmark(state, tap_stream_id, BOOKMARK_KEY_NAME, last_update)
 
