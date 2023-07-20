@@ -220,7 +220,7 @@ def do_sync(config, state, stream):
             counter_data = 0
             for message in reader.rows().pages:
                 frames.append(message.to_dataframe())
-                if len(frames) > 5000:
+                if len(frames) > 2000:
                     df = pd.concat(frames)
                     LOGGER.info(counter_data)
                     for row in df.to_json(orient="records", lines=True).splitlines():
