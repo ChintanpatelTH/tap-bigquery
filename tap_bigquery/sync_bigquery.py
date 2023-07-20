@@ -197,7 +197,7 @@ def do_sync(config, state, stream):
 
     bqstorageclient = bigquery_storage.BigQueryReadClient(credentials=bq_credentials)
     dataset_id = "analytics_327957226"
-    table_id = f'{keys["table"]}_{keys["start_datetime"]}'
+    table_id = f'{keys["table"]}{keys["start_datetime"]}'
     table = f"projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
 
     parent = "projects/{}".format(project_id)
